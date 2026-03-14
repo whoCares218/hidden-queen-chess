@@ -1,4 +1,5 @@
 flask==3.0.3
 flask-socketio==5.3.6
-eventlet==0.36.1
+gevent==24.2.1
+gevent-websocket==0.10.1
 gunicorn==22.0.0
