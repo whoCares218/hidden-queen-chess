@@ -1,18 +1,12 @@
-import eventlet
-eventlet.monkey_patch()  # MUST be first — patches stdlib for async compatibility
-
 from flask import Flask, render_template_string, request
 from flask_socketio import SocketIO, join_room, emit
 import copy, random, string, threading, time as _time, os
 
 app = Flask(__name__)
 app.secret_key = 'hidden-queen-secret-2024'
-# FIX: changed async_mode from 'threading' to 'eventlet'.
-# The old 'threading' mode requires gunicorn's gthread worker.
-# Render's default gunicorn uses sync workers, which block on every
-# long-poll request and make Socket.IO completely non-functional.
-# eventlet is the standard production async mode for Flask-SocketIO.
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+# gevent async_mode: compatible with Python 3.14+ (eventlet is not).
+# Requires gunicorn with GeventWebSocketWorker — see Procfile.
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
 # ── Game state ────────────────────────────────────────────────────────────────
 rooms = {}   # room_id -> GameState dict
