@@ -1,13 +1,19 @@
-import eventlet
-eventlet.monkey_patch()
-
 from flask import Flask, render_template_string, request
 from flask_socketio import SocketIO, join_room, emit
 import copy, random, string, threading, time as _time, os
 
 app = Flask(__name__)
 app.secret_key = 'hidden-queen-secret-2024'
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+# threading mode works on ALL Python versions including 3.14.
+# allow_upgrades=False prevents WebSocket upgrade crash on Render.
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode='threading',
+    allow_upgrades=False,
+    ping_interval=10,
+    ping_timeout=20,
+)
 
 # ── Game state ────────────────────────────────────────────────────────────────
 rooms = {}   # room_id -> GameState dict
