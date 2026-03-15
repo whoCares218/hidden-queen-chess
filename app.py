@@ -41,6 +41,7 @@ def init_room(room_id, time_control_secs=None):
         'time_control': time_control_secs,   # None = unlimited
         'clocks': {'white': time_control_secs, 'black': time_control_secs},
         'clock_turn_start': None,            # epoch float, set when game starts
+        'ai_thinking': False,                # FIX: guard against multiple AI move tasks
     }
 
 SELECTION_TIMEOUT = 15  # seconds
@@ -75,7 +76,8 @@ def _push_state(room_id):
         return
     state = rooms[room_id]
     for sid, c in state['players'].items():
-        bv = board_view(state['board'], c, state['revealed'], state['selected'])
+        # FIX: removed unused 'selected' argument from board_view
+        bv = board_view(state['board'], c, state['revealed'])
         socketio.emit('game_state', {
             'board': bv,
             'turn': state['turn'],
@@ -89,30 +91,33 @@ def _push_state(room_id):
             'clock_turn_start': state['clock_turn_start'],
             'is_ai_game': bool(state.get('ai_color')),
         }, to=sid)
-    # If it's now the AI's turn, schedule its move
+    # FIX: guard against multiple concurrent AI move tasks with ai_thinking flag
     if (state.get('ai_color') and
             state['phase'] == 'playing' and
-            state['turn'] == state['ai_color']):
+            state['turn'] == state['ai_color'] and
+            not state.get('ai_thinking')):
+        state['ai_thinking'] = True
         schedule_ai_move(room_id)
 
 def selection_timer_fired(room_id):
     """Called after 15 s: auto-assign any missing hidden queens, then start."""
-    def _do():
-        if room_id not in rooms:
-            return
-        state = rooms[room_id]
-        if state['phase'] != 'selecting':
-            return
-        for color in ('white', 'black'):
-            if color not in state['selected']:
-                assign_random_queen(state, color)
-                sid = state['sids'].get(color)
-                if sid:
-                    socketio.emit('auto_selected', {}, to=sid)
-        broadcast_game_start(room_id)
-    socketio.start_background_task(_do)
+    # FIX: removed unnecessary socketio.start_background_task wrapper;
+    # this already runs in a threading.Timer thread.
+    if room_id not in rooms:
+        return
+    state = rooms[room_id]
+    if state['phase'] != 'selecting':
+        return
+    for color in ('white', 'black'):
+        if color not in state['selected']:
+            assign_random_queen(state, color)
+            sid = state['sids'].get(color)
+            if sid:
+                socketio.emit('auto_selected', {}, to=sid)
+    broadcast_game_start(room_id)
 
-def board_view(board, viewer_color, revealed, selected):
+# FIX: removed unused 'selected' parameter — it was never referenced inside the function
+def board_view(board, viewer_color, revealed):
     """Return board as seen by viewer: hide opponent's hidden queen."""
     view = []
     for r in range(8):
@@ -164,7 +169,8 @@ def raw_moves(board, fr, fc, en_passant):
     moves = []
     is_hidden_q = p.get('hidden_queen', False)
 
-    if t == 'P' or (t == 'P' and is_hidden_q):
+    # FIX: simplified redundant condition `if t == 'P' or (t == 'P' and is_hidden_q)`
+    if t == 'P':
         d = -1 if color == 'white' else 1
         start_row = 6 if color == 'white' else 1
         if 0 <= fr+d < 8 and board[fr+d][fc] is None:
@@ -224,17 +230,26 @@ def raw_moves(board, fr, fc, en_passant):
 
     return moves
 
-def is_queen_like_move(board, fr, fc, tr, tc):
+# FIX: added en_passant parameter so en passant moves are correctly identified
+# as normal pawn moves and do NOT trigger hidden queen revelation.
+def is_queen_like_move(board, fr, fc, tr, tc, en_passant=None):
     dr = tr - fr
     dc = tc - fc
     color = board[fr][fc]['color']
     d = -1 if color == 'white' else 1
     start_row = 6 if color == 'white' else 1
+    # Normal one-step forward pawn move
     if dc == 0 and dr == d and board[tr][tc] is None:
         return False
+    # Normal two-step pawn advance from starting row
     if dc == 0 and dr == 2*d and fr == start_row and board[tr][tc] is None:
         return False
+    # Normal diagonal pawn capture (target occupied)
     if abs(dc) == 1 and dr == d and board[tr][tc] is not None:
+        return False
+    # FIX: en passant is a normal pawn diagonal capture — NOT a queen-like move.
+    # Previously this was missing, causing the hidden queen to be revealed on en passant.
+    if abs(dc) == 1 and dr == d and en_passant and (tr, tc) == en_passant:
         return False
     return True
 
@@ -299,10 +314,11 @@ def apply_move_to_board(board, fr, fc, tr, tc, en_passant, promote_to='Q'):
                 board[row][3] = board[row][0]
                 board[row][0] = None
 
+    # FIX: merged dead elif into the single if-block.
+    # Previously the `elif p.get('hidden_queen') and p['type'] == 'P'` branch
+    # could NEVER execute because `p['type'] == 'P'` is already required by the
+    # `if` above, meaning the elif was unreachable dead code.
     if p['type'] == 'P' and (tr == 0 or tr == 7):
-        board[tr][tc] = {'color': color, 'type': promote_to,
-                         'id': p['id'], 'hidden_queen': False}
-    elif p.get('hidden_queen') and p['type'] == 'P' and (tr == 0 or tr == 7):
         board[tr][tc] = {'color': color, 'type': promote_to,
                          'id': p['id'], 'hidden_queen': False}
 
@@ -315,7 +331,8 @@ def do_move(state, fr, fc, tr, tc):
 
     revealed = False
     if p.get('hidden_queen') and p['type'] == 'P':
-        if is_queen_like_move(board, fr, fc, tr, tc):
+        # FIX: pass en_passant so en passant moves are not mistaken for queen moves
+        if is_queen_like_move(board, fr, fc, tr, tc, en_passant):
             p['type'] = 'Q'
             p['hidden_queen'] = False
             state['revealed'][color] = True
@@ -507,6 +524,7 @@ def schedule_ai_move(room_id, delay=0.8):
         state = rooms[room_id]
         ai_color = state.get('ai_color')
         if not ai_color or state['phase'] != 'playing' or state['turn'] != ai_color:
+            state['ai_thinking'] = False
             return
         if state['time_control'] and state['clock_turn_start']:
             elapsed = _time.time() - state['clock_turn_start']
@@ -516,10 +534,12 @@ def schedule_ai_move(room_id, delay=0.8):
                 state['winner'] = 'timeout'
                 state['loser'] = ai_color
                 state['clock_turn_start'] = None
+                state['ai_thinking'] = False
                 _push_state(room_id)
                 return
         move = ai_choose_move(state, ai_color, state.get('ai_rating', 1200))
         if not move:
+            state['ai_thinking'] = False
             return
         fr, fc, tr, tc = move
         revealed = do_move(state, fr, fc, tr, tc)
@@ -528,6 +548,7 @@ def schedule_ai_move(room_id, delay=0.8):
         if revealed:
             for sid in list(state['players'].keys()):
                 socketio.emit('queen_revealed', {'color': ai_color, 'was_mine': False}, to=sid)
+        state['ai_thinking'] = False   # FIX: clear flag before pushing state
         _push_state(room_id)
     socketio.start_background_task(_move)
 
@@ -939,17 +960,34 @@ socket.on('auto_selected', () => {
   document.getElementById('select-status').textContent = '⏱ Time\'s up — a pawn was randomly chosen as your hidden queen!';
   document.getElementById('confirm-btn').style.display = 'none';
 });
+
+// FIX: clear selected piece and legal move highlights whenever a new game state
+// arrives from the server. Previously these were never reset on incoming state,
+// causing stale selection highlights and legal-move dots to persist after the
+// opponent made a move.
 socket.on('game_state', data => {
   gameState = data;
   if (data.phase === 'playing' || data.phase === 'gameover') {
     stopCountdown();
     document.getElementById('select-phase').style.display = 'none';
     document.getElementById('game').style.display = 'flex';
+    // Clear stale selection state before re-rendering
+    selected = null;
+    legalMoves = [];
     renderBoard(data); updateStatus(data); updateClocks(data);
   }
 });
+
 socket.on('queen_revealed', data => { showRevealBanner(data.color, data.was_mine); });
 socket.on('legal_moves', data => { legalMoves = data.moves; renderBoard(gameState); });
+
+// FIX: notify the player when their opponent disconnects mid-game
+socket.on('opponent_disconnected', () => {
+  const bar = document.getElementById('status-bar');
+  bar.className = 'gameover';
+  bar.textContent = '🔌 Opponent disconnected';
+  clearInterval(clockInterval);
+});
 
 function startCountdown(seconds) {
   const CIRC = 2 * Math.PI * 30;
@@ -1269,12 +1307,19 @@ def on_play_vs_ai(data):
     t = threading.Timer(SELECTION_TIMEOUT, selection_timer_fired, args=[room_id])
     t.daemon = True; state['selection_timer'] = t; t.start()
 
+# FIX: notify the remaining player when their opponent disconnects mid-game.
+# Previously the opponent would see the game frozen with no feedback.
 @socketio.on('disconnect')
 def on_disconnect():
     for room_id, state in list(rooms.items()):
         if request.sid in state['players']:
+            disconnected_color = state['players'][request.sid]
             del state['players'][request.sid]
-            if not state['players']: del rooms[room_id]
+            # Notify the other human player (if any) that the opponent left
+            for remaining_sid in list(state['players'].keys()):
+                socketio.emit('opponent_disconnected', {}, to=remaining_sid)
+            if not state['players']:
+                del rooms[room_id]
             break
 
 if __name__ == '__main__':
