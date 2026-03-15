@@ -1,13 +1,13 @@
+import eventlet
+eventlet.monkey_patch()
+
 from flask import Flask, render_template_string, request
 from flask_socketio import SocketIO, join_room, emit
 import copy, random, string, threading, time as _time, os
 
 app = Flask(__name__)
 app.secret_key = 'hidden-queen-secret-2024'
-# threading mode + gunicorn gthread worker: works on any Python version.
-# WebSocket upgrade is disabled — polling is rock-solid for a turn-based game.
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading',
-                    allow_upgrades=False)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # ── Game state ────────────────────────────────────────────────────────────────
 rooms = {}   # room_id -> GameState dict
