@@ -2,6 +2,5 @@ services:
   - type: web
     name: hidden-queen-chess
     runtime: python
-    pythonVersion: "3.11.0"
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --worker-class eventlet -w 1 app:app
+    startCommand: gunicorn --worker-class gthread --workers 1 --threads 16 --bind 0.0.0.0:$PORT app:app
