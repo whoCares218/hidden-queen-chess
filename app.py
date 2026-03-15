@@ -1,16 +1,23 @@
-from flask import Flask, render_template_string, request, jsonify, session
+import eventlet
+eventlet.monkey_patch()  # MUST be first — patches stdlib for async compatibility
+
+from flask import Flask, render_template_string, request
 from flask_socketio import SocketIO, join_room, emit
-import uuid, json, copy, random, string, threading, time as _time, os
+import copy, random, string, threading, time as _time, os
 
 app = Flask(__name__)
 app.secret_key = 'hidden-queen-secret-2024'
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+# FIX: changed async_mode from 'threading' to 'eventlet'.
+# The old 'threading' mode requires gunicorn's gthread worker.
+# Render's default gunicorn uses sync workers, which block on every
+# long-poll request and make Socket.IO completely non-functional.
+# eventlet is the standard production async mode for Flask-SocketIO.
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # ── Game state ────────────────────────────────────────────────────────────────
 rooms = {}   # room_id -> GameState dict
 
 def new_board():
-    """Standard 8×8 board. Pieces: R N B Q K B N R / p p p p p p p p"""
     b = [[None]*8 for _ in range(8)]
     back = ['R','N','B','Q','K','B','N','R']
     for c in range(8):
@@ -23,11 +30,11 @@ def new_board():
 def init_room(room_id, time_control_secs=None):
     rooms[room_id] = {
         'board': new_board(),
-        'players': {},        # sid -> 'white'|'black'
-        'sids': {},           # 'white'|'black' -> sid
+        'players': {},
+        'sids': {},
         'turn': 'white',
-        'phase': 'waiting',   # waiting | selecting | playing | gameover
-        'selected': {},       # color -> {row,col} of hidden queen pawn
+        'phase': 'waiting',
+        'selected': {},
         'revealed': {'white': False, 'black': False},
         'winner': None,
         'loser': None,
@@ -38,16 +45,15 @@ def init_room(room_id, time_control_secs=None):
             'white': {'kingside': True, 'queenside': True},
             'black': {'kingside': True, 'queenside': True}
         },
-        'time_control': time_control_secs,   # None = unlimited
+        'time_control': time_control_secs,
         'clocks': {'white': time_control_secs, 'black': time_control_secs},
-        'clock_turn_start': None,            # epoch float, set when game starts
-        'ai_thinking': False,                # FIX: guard against multiple AI move tasks
+        'clock_turn_start': None,
+        'ai_thinking': False,
     }
 
-SELECTION_TIMEOUT = 15  # seconds
+SELECTION_TIMEOUT = 15
 
 def assign_random_queen(state, color):
-    """Pick a random unassigned pawn and mark it as the hidden queen."""
     board = state['board']
     pawn_row = 6 if color == 'white' else 1
     cols = list(range(8))
@@ -60,23 +66,20 @@ def assign_random_queen(state, color):
             return
 
 def broadcast_game_start(room_id):
-    """Transition room to playing phase and push state to both players."""
     if room_id not in rooms:
         return
     state = rooms[room_id]
     if state['phase'] != 'selecting':
         return
     state['phase'] = 'playing'
-    state['clock_turn_start'] = _time.time()  # white moves first
+    state['clock_turn_start'] = _time.time()
     _push_state(room_id)
 
 def _push_state(room_id):
-    """Send current game state to all human players in the room."""
     if room_id not in rooms:
         return
     state = rooms[room_id]
     for sid, c in state['players'].items():
-        # FIX: removed unused 'selected' argument from board_view
         bv = board_view(state['board'], c, state['revealed'])
         socketio.emit('game_state', {
             'board': bv,
@@ -91,7 +94,6 @@ def _push_state(room_id):
             'clock_turn_start': state['clock_turn_start'],
             'is_ai_game': bool(state.get('ai_color')),
         }, to=sid)
-    # FIX: guard against multiple concurrent AI move tasks with ai_thinking flag
     if (state.get('ai_color') and
             state['phase'] == 'playing' and
             state['turn'] == state['ai_color'] and
@@ -100,9 +102,6 @@ def _push_state(room_id):
         schedule_ai_move(room_id)
 
 def selection_timer_fired(room_id):
-    """Called after 15 s: auto-assign any missing hidden queens, then start."""
-    # FIX: removed unnecessary socketio.start_background_task wrapper;
-    # this already runs in a threading.Timer thread.
     if room_id not in rooms:
         return
     state = rooms[room_id]
@@ -116,9 +115,7 @@ def selection_timer_fired(room_id):
                 socketio.emit('auto_selected', {}, to=sid)
     broadcast_game_start(room_id)
 
-# FIX: removed unused 'selected' parameter — it was never referenced inside the function
 def board_view(board, viewer_color, revealed):
-    """Return board as seen by viewer: hide opponent's hidden queen."""
     view = []
     for r in range(8):
         row = []
@@ -169,7 +166,6 @@ def raw_moves(board, fr, fc, en_passant):
     moves = []
     is_hidden_q = p.get('hidden_queen', False)
 
-    # FIX: simplified redundant condition `if t == 'P' or (t == 'P' and is_hidden_q)`
     if t == 'P':
         d = -1 if color == 'white' else 1
         start_row = 6 if color == 'white' else 1
@@ -230,25 +226,18 @@ def raw_moves(board, fr, fc, en_passant):
 
     return moves
 
-# FIX: added en_passant parameter so en passant moves are correctly identified
-# as normal pawn moves and do NOT trigger hidden queen revelation.
 def is_queen_like_move(board, fr, fc, tr, tc, en_passant=None):
     dr = tr - fr
     dc = tc - fc
     color = board[fr][fc]['color']
     d = -1 if color == 'white' else 1
     start_row = 6 if color == 'white' else 1
-    # Normal one-step forward pawn move
     if dc == 0 and dr == d and board[tr][tc] is None:
         return False
-    # Normal two-step pawn advance from starting row
     if dc == 0 and dr == 2*d and fr == start_row and board[tr][tc] is None:
         return False
-    # Normal diagonal pawn capture (target occupied)
     if abs(dc) == 1 and dr == d and board[tr][tc] is not None:
         return False
-    # FIX: en passant is a normal pawn diagonal capture — NOT a queen-like move.
-    # Previously this was missing, causing the hidden queen to be revealed on en passant.
     if abs(dc) == 1 and dr == d and en_passant and (tr, tc) == en_passant:
         return False
     return True
@@ -297,7 +286,7 @@ def apply_move_to_board(board, fr, fc, tr, tc, en_passant, promote_to='Q'):
     color = p['color']
     d = -1 if color == 'white' else 1
 
-    if p['type'] in ('P',) and abs(tc - fc) == 1 and board[tr][tc] is None:
+    if p['type'] == 'P' and abs(tc - fc) == 1 and board[tr][tc] is None:
         if en_passant and (tr, tc) == en_passant:
             board[tr - d][tc] = None
 
@@ -308,19 +297,12 @@ def apply_move_to_board(board, fr, fc, tr, tc, en_passant, promote_to='Q'):
         row = 7 if color == 'white' else 0
         if fr == row and fc == 4:
             if tc == 6:
-                board[row][5] = board[row][7]
-                board[row][7] = None
+                board[row][5] = board[row][7]; board[row][7] = None
             elif tc == 2:
-                board[row][3] = board[row][0]
-                board[row][0] = None
+                board[row][3] = board[row][0]; board[row][0] = None
 
-    # FIX: merged dead elif into the single if-block.
-    # Previously the `elif p.get('hidden_queen') and p['type'] == 'P'` branch
-    # could NEVER execute because `p['type'] == 'P'` is already required by the
-    # `if` above, meaning the elif was unreachable dead code.
     if p['type'] == 'P' and (tr == 0 or tr == 7):
-        board[tr][tc] = {'color': color, 'type': promote_to,
-                         'id': p['id'], 'hidden_queen': False}
+        board[tr][tc] = {'color': color, 'type': promote_to, 'id': p['id'], 'hidden_queen': False}
 
 def do_move(state, fr, fc, tr, tc):
     board = state['board']
@@ -331,7 +313,6 @@ def do_move(state, fr, fc, tr, tc):
 
     revealed = False
     if p.get('hidden_queen') and p['type'] == 'P':
-        # FIX: pass en_passant so en passant moves are not mistaken for queen moves
         if is_queen_like_move(board, fr, fc, tr, tc, en_passant):
             p['type'] = 'Q'
             p['hidden_queen'] = False
@@ -366,12 +347,8 @@ def do_move(state, fr, fc, tr, tc):
                     for r in range(8) for c in range(8)
                     if board[r][c] and board[r][c]['color'] == opp)
     if not has_moves:
-        if in_check:
-            state['phase'] = 'gameover'
-            state['winner'] = color
-        else:
-            state['phase'] = 'gameover'
-            state['winner'] = 'draw'
+        state['phase'] = 'gameover'
+        state['winner'] = color if in_check else 'draw'
     state['check'] = opp if in_check else None
     return revealed
 
@@ -548,7 +525,7 @@ def schedule_ai_move(room_id, delay=0.8):
         if revealed:
             for sid in list(state['players'].keys()):
                 socketio.emit('queen_revealed', {'color': ai_color, 'was_mine': False}, to=sid)
-        state['ai_thinking'] = False   # FIX: clear flag before pushing state
+        state['ai_thinking'] = False
         _push_state(room_id)
     socketio.start_background_task(_move)
 
@@ -596,8 +573,6 @@ HTML = r"""<!DOCTYPE html>
     color:var(--gold-light); text-shadow:0 2px 12px rgba(201,153,58,0.5);
   }
   header p { font-style:italic; color:rgba(245,234,208,0.55); font-size:.85rem; margin-top:.3rem; }
-
-  /* ── Lobby ── */
   #lobby {
     display:flex; flex-direction:column; align-items:center;
     gap:1.4rem; padding:2.5rem 1rem; width:100%; max-width:480px;
@@ -659,8 +634,6 @@ HTML = r"""<!DOCTYPE html>
     color:var(--gold); border:1px solid rgba(201,153,58,0.4);
     padding:.15rem .5rem; border-radius:2px; margin-bottom:.6rem;
   }
-
-  /* ── Game area ── */
   #game { display:none; flex-direction:column; align-items:center; padding:.8rem; width:100%; }
   .clocks-row {
     display:flex; justify-content:space-between; align-items:center;
@@ -718,8 +691,6 @@ HTML = r"""<!DOCTYPE html>
     text-shadow: 0 0 3px #fff, 0 0 6px rgba(255,255,255,0.8), 1px 1px 0 rgba(255,255,255,0.5), -1px -1px 0 rgba(255,255,255,0.5), 1px -1px 0 rgba(255,255,255,0.5), -1px 1px 0 rgba(255,255,255,0.5);
   }
   .piece.hidden-q { filter: drop-shadow(0 0 6px rgba(255,200,50,1)) drop-shadow(0 0 3px rgba(201,153,58,0.9)); }
-
-  /* ── Selection phase ── */
   #select-phase {
     display:none; flex-direction:column; align-items:center;
     gap:.7rem; padding:.8rem 1rem 1.5rem;
@@ -742,10 +713,8 @@ HTML = r"""<!DOCTYPE html>
   #countdown-arc   { stroke:var(--gold); stroke-dashoffset:0; }
   #countdown-num { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-family:'Cinzel',serif; font-size:1.2rem; color:var(--gold-light); font-weight:600; }
   #countdown-label { font-size:.7rem; color:rgba(245,234,208,.4); text-align:center; margin-top:.15rem; font-style:italic; }
-
   @keyframes revealQueen { 0% { transform:scale(0.4) rotate(-20deg); opacity:0; } 60% { transform:scale(1.25) rotate(4deg); } 100% { transform:scale(1) rotate(0); opacity:1; } }
   .piece.just-revealed { animation:revealQueen .5s ease-out forwards; }
-
   #reveal-banner { display:none; position:fixed; inset:0; z-index:2000; background:rgba(10,6,2,0.75); backdrop-filter:blur(4px); align-items:center; justify-content:center; }
   #reveal-banner.show { display:flex; }
   .reveal-card { background:linear-gradient(135deg,#1e1508,#2e1f0a); border:2px solid var(--gold); box-shadow:0 0 80px rgba(201,153,58,0.5), 0 0 20px rgba(201,153,58,0.2); border-radius:6px; padding:2.5rem 3.5rem; text-align:center; max-width:420px; }
@@ -754,7 +723,6 @@ HTML = r"""<!DOCTYPE html>
   .reveal-card p { font-style:italic; color:rgba(245,234,208,0.8); font-size:.95rem; margin-bottom:1.2rem; }
   .dismiss-btn { font-family:'Cinzel',serif; font-size:.78rem; letter-spacing:.12em; text-transform:uppercase; padding:.5rem 1.4rem; border:1px solid rgba(201,153,58,0.5); background:rgba(201,153,58,0.15); color:var(--gold); cursor:pointer; border-radius:2px; }
   .dismiss-btn:hover { background:rgba(201,153,58,0.3); }
-
   .player-tag { font-family:'Cinzel',serif; font-size:.75rem; letter-spacing:.1em; color:rgba(245,234,208,0.45); text-transform:uppercase; display:flex; align-items:center; gap:.5rem; }
   .dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
   .dot-white { background:#f0d9a8; }
@@ -763,13 +731,11 @@ HTML = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-
 <header>
   <h1>⚜ Hidden Queen ⚜</h1>
   <p>A chess variant of deception and revelation</p>
 </header>
 
-<!-- LOBBY -->
 <div id="lobby">
   <div class="card">
     <h2>Create Room</h2>
@@ -798,7 +764,6 @@ HTML = r"""<!DOCTYPE html>
   <p id="lobby-msg" class="hint" style="color:#ff8a8a;min-height:1.2em;"></p>
 </div>
 
-<!-- AI CARD -->
 <div id="lobby-ai" style="display:flex;flex-direction:column;align-items:center;width:100%;max-width:480px;padding:0 1rem 2rem;">
   <div class="card">
     <div class="ai-badge">⚔ vs Computer</div>
@@ -821,7 +786,6 @@ HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<!-- SELECTION PHASE -->
 <div id="select-phase">
   <h2>Choose Your Hidden Queen</h2>
   <p class="desc">Click one of your pawns below — it will secretly become a Queen.<br>
@@ -843,7 +807,6 @@ HTML = r"""<!DOCTYPE html>
   <p id="select-status" class="hint"></p>
 </div>
 
-<!-- GAME -->
 <div id="game">
   <div style="display:flex;gap:1.5rem;align-items:center;margin-bottom:.4rem;">
     <div class="player-tag"><span class="dot dot-white"></span>White</div>
@@ -872,7 +835,6 @@ HTML = r"""<!DOCTYPE html>
   <p class="hint" style="margin-top:.5rem;" id="game-hint"></p>
 </div>
 
-<!-- Reveal banner -->
 <div id="reveal-banner">
   <div class="reveal-card">
     <span class="crown">👑</span>
@@ -960,28 +922,19 @@ socket.on('auto_selected', () => {
   document.getElementById('select-status').textContent = '⏱ Time\'s up — a pawn was randomly chosen as your hidden queen!';
   document.getElementById('confirm-btn').style.display = 'none';
 });
-
-// FIX: clear selected piece and legal move highlights whenever a new game state
-// arrives from the server. Previously these were never reset on incoming state,
-// causing stale selection highlights and legal-move dots to persist after the
-// opponent made a move.
 socket.on('game_state', data => {
   gameState = data;
   if (data.phase === 'playing' || data.phase === 'gameover') {
     stopCountdown();
     document.getElementById('select-phase').style.display = 'none';
     document.getElementById('game').style.display = 'flex';
-    // Clear stale selection state before re-rendering
     selected = null;
     legalMoves = [];
     renderBoard(data); updateStatus(data); updateClocks(data);
   }
 });
-
 socket.on('queen_revealed', data => { showRevealBanner(data.color, data.was_mine); });
 socket.on('legal_moves', data => { legalMoves = data.moves; renderBoard(gameState); });
-
-// FIX: notify the player when their opponent disconnects mid-game
 socket.on('opponent_disconnected', () => {
   const bar = document.getElementById('status-bar');
   bar.className = 'gameover';
@@ -1011,7 +964,6 @@ function stopCountdown() {
   const lbl = document.getElementById('countdown-label');
   if (lbl) lbl.textContent = '';
 }
-
 function showSelectionPhase() {
   document.getElementById('select-phase').style.display = 'flex';
   renderSelectBoard();
@@ -1055,7 +1007,6 @@ function confirmSelection() {
   stopCountdown();
   document.getElementById('select-status').textContent = 'Selection confirmed. Waiting for opponent…';
 }
-
 function renderBoard(state) {
   const boardEl = document.getElementById('board'); boardEl.innerHTML = '';
   const board = state.board, lastMove = state.last_move;
@@ -1089,7 +1040,6 @@ function renderBoard(state) {
     boardEl.appendChild(sq);
   }); });
 }
-
 function onSquareClick(r, c) {
   if (!gameState || gameState.phase !== 'playing') return;
   if (gameState.turn !== myColor) return;
@@ -1110,7 +1060,6 @@ function onSquareClick(r, c) {
     legalMoves = []; renderBoard(gameState);
   }
 }
-
 function fmtSecs(s) {
   if (s === null || s === undefined) return '—';
   s = Math.max(0, Math.ceil(s));
@@ -1149,7 +1098,6 @@ function updateClocks(state) {
   refreshDisplay();
   if (state.phase === 'playing') clockInterval = setInterval(refreshDisplay, 500);
 }
-
 function updateStatus(state) {
   const bar = document.getElementById('status-bar'), hint = document.getElementById('game-hint');
   bar.className = '';
@@ -1172,7 +1120,6 @@ function updateStatus(state) {
     hint.textContent = '';
   }
 }
-
 function showRevealBanner(color, wasMine) {
   clearTimeout(revealTimeout);
   document.getElementById('reveal-title').textContent = wasMine ? '👑 Your Queen Reveals!' : '👁 Enemy Queen Revealed!';
@@ -1307,15 +1254,11 @@ def on_play_vs_ai(data):
     t = threading.Timer(SELECTION_TIMEOUT, selection_timer_fired, args=[room_id])
     t.daemon = True; state['selection_timer'] = t; t.start()
 
-# FIX: notify the remaining player when their opponent disconnects mid-game.
-# Previously the opponent would see the game frozen with no feedback.
 @socketio.on('disconnect')
 def on_disconnect():
     for room_id, state in list(rooms.items()):
         if request.sid in state['players']:
-            disconnected_color = state['players'][request.sid]
             del state['players'][request.sid]
-            # Notify the other human player (if any) that the opponent left
             for remaining_sid in list(state['players'].keys()):
                 socketio.emit('opponent_disconnected', {}, to=remaining_sid)
             if not state['players']:
