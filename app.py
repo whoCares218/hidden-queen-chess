@@ -4,9 +4,10 @@ import copy, random, string, threading, time as _time, os
 
 app = Flask(__name__)
 app.secret_key = 'hidden-queen-secret-2024'
-# gevent async_mode: compatible with Python 3.14+ (eventlet is not).
-# Requires gunicorn with GeventWebSocketWorker — see Procfile.
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
+# threading mode + gunicorn gthread worker: works on any Python version.
+# WebSocket upgrade is disabled — polling is rock-solid for a turn-based game.
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading',
+                    allow_upgrades=False)
 
 # ── Game state ────────────────────────────────────────────────────────────────
 rooms = {}   # room_id -> GameState dict
